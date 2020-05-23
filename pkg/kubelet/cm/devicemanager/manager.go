@@ -105,10 +105,6 @@ type ManagerImpl struct {
 
 	// Store of Topology Affinties that the Device Manager can query.
 	topologyAffinityStore topologymanager.Store
-
-	// devicesToReuse contains devices that can be reused as they have been allocated to
-	// init containers.
-	devicesToReuse PodReusableDevices
 }
 
 type endpointInfo struct {
@@ -117,9 +113,6 @@ type endpointInfo struct {
 }
 
 type sourcesReadyStub struct{}
-
-// PodReusableDevices is a map by pod name of devices to reuse.
-type PodReusableDevices map[string]map[string]sets.String
 
 func (s *sourcesReadyStub) AddSource(source string) {}
 func (s *sourcesReadyStub) AllReady() bool          { return true }
@@ -154,7 +147,6 @@ func newManagerImpl(socketPath string, numaNodeInfo cputopology.NUMANodeInfo, to
 		podDevices:            make(podDevices),
 		numaNodes:             numaNodes,
 		topologyAffinityStore: topologyAffinityStore,
-		devicesToReuse:        make(PodReusableDevices),
 	}
 	manager.callback = manager.genericDeviceUpdateCallback
 
@@ -361,33 +353,38 @@ func (m *ManagerImpl) isVersionCompatibleWithPlugin(versions []string) bool {
 // Allocate is the call that you can use to allocate a set of devices
 // from the registered device plugins.
 func (m *ManagerImpl) Allocate(pod *v1.Pod, container *v1.Container) error {
-	if _, ok := m.devicesToReuse[string(pod.UID)]; !ok {
-		m.devicesToReuse[string(pod.UID)] = make(map[string]sets.String)
-	}
-	// If pod entries to m.devicesToReuse other than the current pod exist, delete them.
-	for podUID := range m.devicesToReuse {
-		if podUID != string(pod.UID) {
-			delete(m.devicesToReuse, podUID)
-		}
-	}
 	// Allocate resources for init containers first as we know the caller always loops
 	// through init containers before looping through app containers. Should the caller
 	// ever change those semantics, this logic will need to be amended.
 	for _, initContainer := range pod.Spec.InitContainers {
 		if container.Name == initContainer.Name {
-			if err := m.allocateContainerResources(pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+			if err := m.allocateContainerResources(pod, container); err != nil {
 				return err
 			}
-			m.podDevices.addContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
 			return nil
 		}
 	}
-	if err := m.allocateContainerResources(pod, container, m.devicesToReuse[string(pod.UID)]); err != nil {
+	if err := m.allocateContainerResources(pod, container); err != nil {
 		return err
 	}
-	m.podDevices.removeContainerAllocatedResources(string(pod.UID), container.Name, m.devicesToReuse[string(pod.UID)])
 	return nil
 
+}
+
+// Deallocate is the call that you can use to deallocate a set of devices
+// from the registered device plugins.
+func (m *ManagerImpl) Deallocate(podUID string, containerName string) {
+	m.mutex.Lock()
+	for resource, devices := range m.podDevices[podUID][containerName] {
+		eI, _ := m.endpoints[resource]
+		if eI.opts == nil || !eI.opts.DeallocateRequired {
+			klog.V(4).Infof("Plugin options indicate to skip Deallocate for resource: %s", resource)
+			continue
+		}
+		eI.e.deallocate(devices.deviceIds.UnsortedList())
+	}
+	m.allocatedDevices = m.podDevices.devices()
+	m.mutex.Unlock()
 }
 
 // UpdatePluginResources updates node resources based on devices already allocated to pods.
@@ -630,6 +627,20 @@ func (m *ManagerImpl) UpdateAllocatedDevices() {
 		return
 	}
 	klog.V(3).Infof("pods to be removed: %v", podsToBeRemoved.List())
+	for _, pod := range podsToBeRemoved.List() {
+		for _, resourceInfo := range m.podDevices[pod] {
+			for resourceName, devs := range resourceInfo {
+				eI, ok := m.endpoints[resourceName]
+				if ok {
+					if eI.opts == nil || !eI.opts.DeallocateRequired {
+						klog.V(4).Infof("Plugin options indicate to skip Deallocate for resource: %s", resourceName)
+						continue
+					}
+					eI.e.deallocate(devs.deviceIds.UnsortedList())
+				}
+			}
+		}
+	}
 	m.podDevices.delete(podsToBeRemoved.List())
 	// Regenerated allocatedDevices after we update pod allocation information.
 	m.allocatedDevices = m.podDevices.devices()
@@ -637,7 +648,7 @@ func (m *ManagerImpl) UpdateAllocatedDevices() {
 
 // Returns list of device Ids we need to allocate with Allocate rpc call.
 // Returns empty list in case we don't need to issue the Allocate rpc call.
-func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, required int, reusableDevices sets.String) (sets.String, error) {
+func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, required int) (sets.String, error) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	needed := required
@@ -663,14 +674,6 @@ func (m *ManagerImpl) devicesToAllocate(podUID, contName, resource string, requi
 		return nil, fmt.Errorf("can't allocate unregistered device %s", resource)
 	}
 	devices = sets.NewString()
-	// Allocates from reusableDevices list first.
-	for device := range reusableDevices {
-		devices.Insert(device)
-		needed--
-		if needed == 0 {
-			return devices, nil
-		}
-	}
 	// Needs to allocate additional devices.
 	if m.allocatedDevices[resource] == nil {
 		m.allocatedDevices[resource] = sets.NewString()
@@ -772,7 +775,7 @@ func (m *ManagerImpl) takeByTopology(resource string, available sets.String, aff
 // plugin resources for the input container, issues an Allocate rpc request
 // for each new device resource requirement, processes their AllocateResponses,
 // and updates the cached containerDevices on success.
-func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Container, devicesToReuse map[string]sets.String) error {
+func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Container) error {
 	podUID := string(pod.UID)
 	contName := container.Name
 	allocatedDevicesUpdated := false
@@ -793,7 +796,7 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 			m.UpdateAllocatedDevices()
 			allocatedDevicesUpdated = true
 		}
-		allocDevices, err := m.devicesToAllocate(podUID, contName, resource, needed, devicesToReuse[resource])
+		allocDevices, err := m.devicesToAllocate(podUID, contName, resource, needed)
 		if err != nil {
 			return err
 		}
@@ -833,6 +836,11 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 		if err != nil {
 			// In case of allocation failure, we want to restore m.allocatedDevices
 			// to the actual allocated state from m.podDevices.
+			if eI.opts == nil || !eI.opts.DeallocateRequired {
+				klog.V(4).Infof("Plugin options indicate to skip Deallocate for resource: %s", resource)
+			} else {
+				eI.e.deallocate(devs)
+			}
 			m.mutex.Lock()
 			m.allocatedDevices = m.podDevices.devices()
 			m.mutex.Unlock()
@@ -857,6 +865,14 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 // for the passed-in <pod, container> and returns its DeviceRunContainerOptions
 // for the found one. An empty struct is returned in case no cached state is found.
 func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Container) (*DeviceRunContainerOptions, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return m.podDevices.deviceRunContainerOptions(string(pod.UID), container.Name), nil
+}
+
+// PreStartContainer loops over all the devices of this container and issued grpc for
+// each of them if needed
+func (m *ManagerImpl) PreStartContainer(pod *v1.Pod, container *v1.Container) error {
 	podUID := string(pod.UID)
 	contName := container.Name
 	needsReAllocate := false
@@ -867,7 +883,7 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Co
 		}
 		err := m.callPreStartContainerIfNeeded(podUID, contName, resource)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		// This is a device plugin resource yet we don't have cached
 		// resource state. This is likely due to a race during node
@@ -879,12 +895,10 @@ func (m *ManagerImpl) GetDeviceRunContainerOptions(pod *v1.Pod, container *v1.Co
 	if needsReAllocate {
 		klog.V(2).Infof("needs re-allocate device plugin resources for pod %s, container %s", podUID, container.Name)
 		if err := m.Allocate(pod, container); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	return m.podDevices.deviceRunContainerOptions(string(pod.UID), container.Name), nil
+	return nil
 }
 
 // callPreStartContainerIfNeeded issues PreStartContainer grpc call for device plugin resource
@@ -918,6 +932,44 @@ func (m *ManagerImpl) callPreStartContainerIfNeeded(podUID, contName, resource s
 	}
 	// TODO: Add metrics support for init RPC
 	return nil
+}
+
+// PostStopContainer loops over all the devices of this container and issued grpc for
+// each of them if needed
+func (m *ManagerImpl) PostStopContainer(podUID string, containerName string) {
+	for resource := range m.podDevices[podUID][containerName] {
+		m.callPostStopContainerIfNeeded(podUID, containerName, resource)
+	}
+}
+
+// callPostStopContainerIfNeeded issues PostStopContainer grpc call for device plugin resource
+// with PostStopRequired option set.
+func (m *ManagerImpl) callPostStopContainerIfNeeded(podUID, containerName, resource string) {
+	m.mutex.Lock()
+	eI, ok := m.endpoints[resource]
+	if !ok {
+		m.mutex.Unlock()
+		klog.V(4).Infof("endpoint not found in cache for a registered resource: %s", resource)
+		return
+	}
+
+	if eI.opts == nil || !eI.opts.PostStopRequired {
+		m.mutex.Unlock()
+		klog.V(4).Infof("Plugin options indicate to skip PostStopContainer for resource: %s", resource)
+		return
+	}
+
+	devices := m.podDevices.containerDevices(podUID, containerName, resource)
+	if devices == nil {
+		m.mutex.Unlock()
+		klog.V(4).Infof("no devices found allocated in local cache for pod %s, container %s, resource %s", podUID, containerName, resource)
+		return
+	}
+
+	m.mutex.Unlock()
+	devs := devices.UnsortedList()
+	klog.V(4).Infof("Issuing a PostStopContainer call for container, %s, of pod %s", containerName, podUID)
+	eI.e.postStopContainer(devs)
 }
 
 // sanitizeNodeAllocatable scans through allocatedDevices in the device manager

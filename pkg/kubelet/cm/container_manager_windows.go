@@ -36,6 +36,7 @@ import (
 	podresourcesapi "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -153,6 +154,10 @@ func (cm *containerManagerImpl) GetPluginRegistrationHandler() cache.PluginHandl
 	return nil
 }
 
+func (cm *containerManagerImpl) GetDevicePluginManager() devicemanager.Manager {
+    return nil
+}
+
 func (cm *containerManagerImpl) GetDevicePluginResourceCapacity() (v1.ResourceList, v1.ResourceList, []string) {
 	return nil, nil, []string{}
 }
@@ -169,8 +174,11 @@ func (cm *containerManagerImpl) UpdatePluginResources(*schedulernodeinfo.NodeInf
 	return nil
 }
 
+func (cm *containerManagerImpl) DeletePluginResources(podUID string, containerName string) {}
+
 func (cm *containerManagerImpl) InternalContainerLifecycle() InternalContainerLifecycle {
-	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(), topologymanager.NewFakeManager()}
+	dm, _ := devicemanager.NewManagerStub()
+	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(), dm, topologymanager.NewFakeManager()}
 }
 
 func (cm *containerManagerImpl) GetPodCgroupRoot() string {

@@ -32,8 +32,14 @@ const (
 
 type containerStatusbyCreatedList []*kubecontainer.ContainerStatus
 
+type deletorCandidate struct {
+	podUID        string
+	containerName string
+	container     kubecontainer.ContainerID
+}
+
 type podContainerDeletor struct {
-	worker           chan<- kubecontainer.ContainerID
+	worker           chan<- deletorCandidate
 	containersToKeep int
 }
 
@@ -44,11 +50,14 @@ func (a containerStatusbyCreatedList) Less(i, j int) bool {
 }
 
 func newPodContainerDeletor(runtime kubecontainer.Runtime, containersToKeep int) *podContainerDeletor {
-	buffer := make(chan kubecontainer.ContainerID, containerDeletorBufferLimit)
+	buffer := make(chan deletorCandidate, containerDeletorBufferLimit)
 	go wait.Until(func() {
 		for {
-			id := <-buffer
-			runtime.DeleteContainer(id)
+            candidate := <-buffer
+			podUID := candidate.podUID
+			containerName := candidate.containerName
+			id := candidate.container
+			runtime.DeleteContainer(podUID, containerName, id)
 		}
 	}, 0, wait.NeverStop)
 
@@ -97,7 +106,7 @@ func getContainersToDeleteInPod(filterContainerID string, podStatus *kubecontain
 }
 
 // deleteContainersInPod issues container deletion requests for containers selected by getContainersToDeleteInPod.
-func (p *podContainerDeletor) deleteContainersInPod(filterContainerID string, podStatus *kubecontainer.PodStatus, removeAll bool) {
+func (p *podContainerDeletor) deleteContainersInPod(podUID string, filterContainerID string, podStatus *kubecontainer.PodStatus, removeAll bool) {
 	containersToKeep := p.containersToKeep
 	if removeAll {
 		containersToKeep = 0
@@ -105,8 +114,9 @@ func (p *podContainerDeletor) deleteContainersInPod(filterContainerID string, po
 	}
 
 	for _, candidate := range getContainersToDeleteInPod(filterContainerID, podStatus, containersToKeep) {
+		deleteInfo := deletorCandidate{podUID: podUID, containerName: candidate.Name}
 		select {
-		case p.worker <- candidate.ID:
+		case p.worker <- deleteInfo:
 		default:
 			klog.Warningf("Failed to issue the request to remove container %v", candidate.ID)
 		}

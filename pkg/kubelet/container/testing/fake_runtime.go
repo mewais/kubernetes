@@ -349,7 +349,7 @@ func (f *FakeRuntime) GarbageCollect(gcPolicy kubecontainer.ContainerGCPolicy, r
 	return f.Err
 }
 
-func (f *FakeRuntime) DeleteContainer(containerID kubecontainer.ContainerID) error {
+func (f *FakeRuntime) DeleteContainer(podUID string, containerName string, containerID kubecontainer.ContainerID) error {
 	f.Lock()
 	defer f.Unlock()
 

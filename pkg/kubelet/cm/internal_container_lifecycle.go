@@ -22,24 +22,32 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 )
 
 type InternalContainerLifecycle interface {
 	PreStartContainer(pod *v1.Pod, container *v1.Container, containerID string) error
 	PreStopContainer(containerID string) error
-	PostStopContainer(containerID string) error
+	PostStopContainer(podUID string, containerName string, containerID string) error
 }
 
 // Implements InternalContainerLifecycle interface.
 type internalContainerLifecycleImpl struct {
 	cpuManager      cpumanager.Manager
+	deviceManager   devicemanager.Manager
 	topologyManager topologymanager.Manager
 }
 
 func (i *internalContainerLifecycleImpl) PreStartContainer(pod *v1.Pod, container *v1.Container, containerID string) error {
 	if i.cpuManager != nil {
 		err := i.cpuManager.AddContainer(pod, container, containerID)
+		if err != nil {
+			return err
+		}
+	}
+	if i.deviceManager != nil {
+		err := i.deviceManager.PreStartContainer(pod, container)
 		if err != nil {
 			return err
 		}
@@ -60,7 +68,8 @@ func (i *internalContainerLifecycleImpl) PreStopContainer(containerID string) er
 	return nil
 }
 
-func (i *internalContainerLifecycleImpl) PostStopContainer(containerID string) error {
+func (i *internalContainerLifecycleImpl) PostStopContainer(podUID string, containerName string, containerID string) error {
+	i.deviceManager.PostStopContainer(podUID, containerName)
 	if i.cpuManager != nil {
 		err := i.cpuManager.RemoveContainer(containerID)
 		if err != nil {

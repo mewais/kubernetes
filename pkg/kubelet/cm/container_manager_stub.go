@@ -24,6 +24,7 @@ import (
 	internalapi "k8s.io/cri-api/pkg/apis"
 	podresourcesapi "k8s.io/kubernetes/pkg/kubelet/apis/podresources/v1alpha1"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpumanager"
+	"k8s.io/kubernetes/pkg/kubelet/cm/devicemanager"
 	"k8s.io/kubernetes/pkg/kubelet/cm/topologymanager"
 	"k8s.io/kubernetes/pkg/kubelet/config"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
@@ -85,6 +86,10 @@ func (cm *containerManagerStub) GetPluginRegistrationHandler() cache.PluginHandl
 	return nil
 }
 
+func (cm *containerManagerStub) GetDevicePluginManager() devicemanager.Manager {
+    return nil
+}
+
 func (cm *containerManagerStub) GetDevicePluginResourceCapacity() (v1.ResourceList, v1.ResourceList, []string) {
 	return nil, nil, []string{}
 }
@@ -101,8 +106,11 @@ func (cm *containerManagerStub) UpdatePluginResources(*schedulernodeinfo.NodeInf
 	return nil
 }
 
+func (cm *containerManagerStub) DeletePluginResources(podUID string, containerName string) {}
+
 func (cm *containerManagerStub) InternalContainerLifecycle() InternalContainerLifecycle {
-	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(), topologymanager.NewFakeManager()}
+	dm, _ := devicemanager.NewManagerStub()
+	return &internalContainerLifecycleImpl{cpumanager.NewFakeManager(), dm, topologymanager.NewFakeManager()}
 }
 
 func (cm *containerManagerStub) GetPodCgroupRoot() string {
